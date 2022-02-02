@@ -42,7 +42,6 @@ object CyclicBarriers extends IOApp.Simple {
    * Exercise: Implement your own CB with Ref + Deferred.
    */
 
-
   override def run: IO[Unit] = openNetwork()
 
 }

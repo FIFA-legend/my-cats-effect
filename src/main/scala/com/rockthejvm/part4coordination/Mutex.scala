@@ -1,5 +1,6 @@
 package com.rockthejvm.part4coordination
 
+import cats.effect.kernel.Concurrent
 import cats.effect.kernel.Outcome.{Canceled, Errored, Succeeded}
 import cats.effect.{Deferred, IO, IOApp, Ref}
 
@@ -84,6 +85,55 @@ object Mutex {
   }
 }
 
+import cats.syntax.flatMap._
+import cats.syntax.functor._
+import cats.effect.syntax.monadCancel._
+
+abstract class GMutex[F[_]] {
+  def acquire: F[Unit]
+  def release: F[Unit]
+}
+
+object GMutex {
+  type Signal[F[_]] = Deferred[F, Unit]
+  case class State[F[_]](locked: Boolean, waiting: Queue[Signal[F]])
+
+  def unlocked[F[_]] = State[F](locked = false, Queue())
+  def createSignal[F[_]](using concurrent: Concurrent[F]): F[Signal[F]] = concurrent.deferred[Unit]
+
+  def create[F[_]](using concurrent: Concurrent[F]): F[GMutex[F]] =
+    concurrent.ref(unlocked[F]).map(state => createMutexWithCancellation(state))
+
+  def createMutexWithCancellation[F[_]](state: Ref[F, State[F]])(using concurrent: Concurrent[F]): GMutex[F] =
+    new GMutex[F] {
+      override def acquire: F[Unit] = concurrent.uncancelable { poll =>
+        createSignal[F].flatMap { signal =>
+
+          val cleanup = state.modify {
+            case State(locked, queue) =>
+              val newQueue = queue.filterNot(_ eq signal)
+              State(locked, newQueue) -> release
+          }.flatten
+
+          state.modify {
+            case State(false, _) => State[F](locked = true, Queue()) -> concurrent.unit
+            case State(true, queue) => State[F](locked = true, queue.enqueue(signal)) -> poll(signal.get).onCancel(cleanup)
+          }.flatten
+        }
+      }
+
+      override def release: F[Unit] = state.modify {
+        case State(false, _) => unlocked[F] -> concurrent.unit
+        case State(true, queue) =>
+          if (queue.isEmpty) unlocked[F] -> concurrent.unit
+          else {
+            val (signal, rest) = queue.dequeue
+            State[F](locked = true, rest) -> signal.complete(()).void
+          }
+      }.flatten
+    }
+}
+
 object MutexPlayground extends IOApp.Simple {
 
   def criticalTask(): IO[Int] = IO.sleep(1.second) >> IO(Random.nextInt(100))
@@ -96,7 +146,7 @@ object MutexPlayground extends IOApp.Simple {
 
   def demoNonLockingTasks(): IO[List[Int]] = (1 to 10).toList.parTraverse(id => createNonLockingTask(id))
 
-  def createLockingTask(id: Int, mutex: Mutex): IO[Int] = for {
+  def createLockingTask(id: Int, mutex: GMutex[IO]): IO[Int] = for {
     _ <- IO(s"[task $id] waiting for permission...").debug
     _ <- mutex.acquire // blocks if the mutex has been acquired by some other fiber
     // critical section
@@ -109,12 +159,12 @@ object MutexPlayground extends IOApp.Simple {
   } yield res
 
   def demoLockingTasks() = for {
-    mutex <- Mutex.create
+    mutex <- GMutex.create[IO]
     results <- (1 to 10).toList.parTraverse(id => createLockingTask(id, mutex))
   } yield results
   // only one task will proceed at one time
 
-  def createCancellingTask(id: Int, mutex: Mutex): IO[Int] =
+  def createCancellingTask(id: Int, mutex: GMutex[IO]): IO[Int] =
     if (id % 2 == 0) createLockingTask(id, mutex)
     else for {
       fib <- createLockingTask(id, mutex).onCancel(IO(s"[task $id] received cancellation!").debug.void).start
@@ -128,7 +178,7 @@ object MutexPlayground extends IOApp.Simple {
     } yield result
 
   def demoCancellingTasks() = for {
-    mutex <- Mutex.create
+    mutex <- GMutex.create[IO]
     results <- (1 to 10).toList.parTraverse(id => createCancellingTask(id, mutex))
   } yield results
 
